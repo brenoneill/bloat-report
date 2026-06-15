@@ -264,16 +264,8 @@ export function registerConversations(program: Command): void {
       }
     });
 
-  // `report` is its own group so future report types (beyond bloat) plug in
-  // alongside it without reshaping the CLI.
-  const report = conversations
+  conversations
     .command("report")
-    .description("Run analysis reports across conversations")
-    // Called bare (no report type), show what's available instead of doing nothing.
-    .action((_opts, cmd: Command) => cmd.help());
-
-  report
-    .command("bloat")
     .description("Find context-bloat patterns and the small change that fixes each")
     .option("-p, --provider <name>", "limit to one provider (e.g. claude, codex)")
     .option("-n, --limit <count>", "max conversations to scan", String(DEFAULT_LIMIT))
@@ -416,7 +408,7 @@ export function registerConversations(program: Command): void {
         console.log("Nothing Climbing or Heavy — every scanned conversation looks healthy. (--all to list them.)");
       }
       console.log("\nTo dig deeper, export flagged conversations and upload to an LLM:");
-      console.log("  conversations export                  (saves bloat-report-export-<date>.md)");
+      console.log("  conversations export                  (saves export-<date>.md)");
       console.log("  conversations export <id>             (one specific conversation)");
     });
 
