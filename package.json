@@ -1,6 +1,6 @@
 {
   "name": "bloat-report",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Inspect agent conversations to see how you can make big savings from small changes",
   "type": "module",
   "bin": {
