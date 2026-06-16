@@ -146,6 +146,158 @@ function totalTokens(c: ConversationSummary): number {
   );
 }
 
+export function addReportCommand(parent: Command): void {
+  parent
+    .command("report")
+    .description("Find context-bloat patterns and the small change that fixes each")
+    .option("-p, --provider <name>", "limit to one provider (e.g. claude, codex)")
+    .option("-n, --limit <count>", "max conversations to scan", String(DEFAULT_LIMIT))
+    .option("-a, --all", "show every scanned conversation, not just Climbing/Heavy ones")
+    .action(async (opts, cmd) => {
+      const g = globalOpts(cmd);
+      const limit = Number.parseInt(opts.limit, 10) || 30;
+
+      const adapters = resolveAdapters(opts.provider);
+      if (opts.provider && adapters.length === 0) {
+        console.error(`Unknown provider: ${opts.provider}`);
+        process.exitCode = 1;
+        return;
+      }
+
+      // List is cheap; sort recent-first and only fully parse the ones we report.
+      const summaries: ConversationSummary[] = [];
+      for (const adapter of adapters) {
+        if (!(await adapter.isAvailable())) continue;
+        summaries.push(...(await adapter.listConversations()));
+      }
+      summaries.sort((a, b) => b.startedAt.localeCompare(a.startedAt));
+
+      const rows: {
+        summary: ConversationSummary;
+        report: ReturnType<typeof computeCacheReport>;
+        health: CacheHealth | null;
+        dumbZone: DumbZoneReport;
+      }[] = [];
+      for (const summary of summaries.slice(0, limit)) {
+        // Only Claude has token-level usage today; skip a conversation with no
+        // token signal rather than reporting a hollow zero (graceful degradation).
+        if (!summary.capabilities.has("tokenUsage")) continue;
+        // Single-provider for now; once summaries carry their source adapter,
+        // load from that one instead of assuming the first available.
+        const owner = adapters.find((a) => a.id === "claude") ?? adapters[0];
+        if (!owner) continue;
+        const convo = await owner.loadConversation(summary.sessionId);
+        if (!convo) continue;
+        const report = computeCacheReport(convo.messages, claudePricing);
+        const dumbZone = computeDumbZoneReport(convo.messages);
+        rows.push({ summary, report, health: cacheHealthFromReport(report), dumbZone });
+      }
+
+      if (g.json) {
+        console.log(
+          JSON.stringify(
+            rows.map((r) => ({
+              sessionId: r.summary.sessionId,
+              title: r.summary.title,
+              totalCost: r.report.totalCost,
+              recoverableBloatCost: r.report.recoverableBloatCost,
+              aboveBaselineContextCost: r.report.aboveBaselineContextCost,
+              finalRampRatio: r.report.finalRampRatio,
+              cacheHitRatio: r.report.cacheHitRatio,
+              health: r.health,
+              dumbZone: r.dumbZone,
+              recommendations: r.report.recommendations,
+            })),
+            null,
+            2,
+          ),
+        );
+        return;
+      }
+
+      if (rows.length === 0) {
+        console.log("No conversations with token data to analyse.");
+        return;
+      }
+
+      const climbingOrWorse = rows.filter(
+        (r) => r.health === "climbing" || r.health === "poor",
+      ).length;
+      const heavyBloat = rows.filter((r) => r.health === "poor").length;
+      const totalRecoverable = rows.reduce((sum, r) => sum + r.report.recoverableBloatCost, 0);
+      const scanned = rows.length;
+      const climbingFraction = `${climbingOrWorse}/${scanned} climbing or worse`;
+      const heavyFraction = heavyBloat > 0 ? `  ·  ${heavyBloat} heavy drift` : "";
+      const recoverableStr =
+        totalRecoverable > 0 ? `  ·  ${formatUSD(totalRecoverable)} recoverable` : "";
+
+      // ── Dumb Zone ──────────────────────────────────────────────────────────
+      // Past ~100k tokens of context, model quality tends to drop off. A single
+      // prompt over the line is noise; staying there for 2+ prompts means the
+      // session should have been cleared, compacted, or split. List who did.
+      const tokK = `${Math.round(DUMB_ZONE_TOKENS / 1000)}k`;
+      const inZone = rows
+        .filter((r) => r.dumbZone.inDumbZone)
+        .sort((a, b) => b.dumbZone.promptsInZone - a.dumbZone.promptsInZone);
+
+      console.log(`\nDumb Zone — context past ${tokK} tokens, where the model gets noticeably worse.`);
+      if (inZone.length === 0) {
+        console.log(`No conversations lingered there. (Flagged at ${DUMB_ZONE_MIN_PROMPTS}+ prompts past ${tokK}.)`);
+      } else {
+        console.log(
+          `${inZone.length}/${rows.length} conversation${inZone.length === 1 ? "" : "s"} kept going past ${tokK} tokens for ${DUMB_ZONE_MIN_PROMPTS}+ prompts:`,
+        );
+        for (const { summary, dumbZone } of inZone) {
+          const date = summary.startedAt ? summary.startedAt.slice(0, 10) : "??????????";
+          const id = summary.sessionId.slice(0, 8);
+          const prompts = `${dumbZone.promptsInZone} prompt${dumbZone.promptsInZone === 1 ? "" : "s"} in zone`.padEnd(20);
+          const peak = `peak ${Math.round(dumbZone.peakContextTokens / 1000)}k`.padEnd(11);
+          console.log(`${id}  ${date}  ${prompts}${peak}${summary.title}`);
+        }
+        console.log("Fix: /clear or /compact at the task boundary, or start a fresh conversation, before context runs past the line.");
+      }
+
+      // ── Bloat table (secondary) ──────────────────────────────────────────────
+      // Biggest recoverable bloat first — the opportunities worth reviewing.
+      console.log("\nBloat (secondary) — recoverable cost from carrying stale context past an early-session baseline.");
+      console.log(`Scanned ${scanned} conversations: ${climbingFraction}${heavyFraction}${recoverableStr}`);
+      rows.sort((a, b) => b.report.recoverableBloatCost - a.report.recoverableBloatCost);
+      // By default the table lists only the conversations worth acting on —
+      // Climbing or Heavy. Pass --all to see every scanned conversation. The
+      // summary line above still counts the full scan either way.
+      const listed = opts.all
+        ? rows
+        : rows.filter((r) => r.health === "climbing" || r.health === "poor");
+      let totalBloat = 0;
+      for (const { summary, report, health, dumbZone } of listed) {
+        totalBloat += report.recoverableBloatCost;
+        const date = summary.startedAt ? summary.startedAt.slice(0, 10) : "??????????";
+        const id = summary.sessionId.slice(0, 8);
+        const cost = `cost ${formatUSD(report.totalCost)}`.padEnd(14);
+        const bloat = `bloat ${formatUSD(report.recoverableBloatCost)}`.padEnd(15);
+        const ramp = `ramp ${report.finalRampRatio.toFixed(1)}×`.padEnd(11);
+        const hit = `hit ${(report.cacheHitRatio * 100).toFixed(0)}%`.padEnd(9);
+        const dz = `dumb zone ${dumbZone.inDumbZone ? "yes" : "no"}`.padEnd(15);
+        const healthLabel = bloatHealthLabel(health);
+        console.log(
+          `${id}  ${date}  ${healthLabel.padEnd(12)}${cost}${bloat}${ramp}${hit}${dz}${summary.title}`,
+        );
+        if (g.verbose) {
+          for (const rec of report.recommendations) {
+            console.log(`            [${rec.severity}] ${rec.title}`);
+            console.log(`              ${rec.message}`);
+          }
+        }
+      }
+      if (listed.length === 0) {
+        console.log("Nothing Climbing or Heavy — every scanned conversation looks healthy. (--all to list them.)");
+      }
+      console.log("\nTo dig deeper, export flagged conversations and upload to an LLM:");
+      console.log("  conversations export                  (saves export-<date>.md)");
+      console.log("  conversations export <id>             (one specific conversation)");
+    });
+}
+
 export function registerConversations(program: Command): void {
   const conversations = program
     .command("conversations")
@@ -264,153 +416,7 @@ export function registerConversations(program: Command): void {
       }
     });
 
-  conversations
-    .command("report")
-    .description("Find context-bloat patterns and the small change that fixes each")
-    .option("-p, --provider <name>", "limit to one provider (e.g. claude, codex)")
-    .option("-n, --limit <count>", "max conversations to scan", String(DEFAULT_LIMIT))
-    .option("-a, --all", "show every scanned conversation, not just Climbing/Heavy ones")
-    .action(async (opts, cmd) => {
-      const g = globalOpts(cmd);
-      const limit = Number.parseInt(opts.limit, 10) || 30;
-
-      const adapters = resolveAdapters(opts.provider);
-      if (opts.provider && adapters.length === 0) {
-        console.error(`Unknown provider: ${opts.provider}`);
-        process.exitCode = 1;
-        return;
-      }
-
-      // List is cheap; sort recent-first and only fully parse the ones we report.
-      const summaries: ConversationSummary[] = [];
-      for (const adapter of adapters) {
-        if (!(await adapter.isAvailable())) continue;
-        summaries.push(...(await adapter.listConversations()));
-      }
-      summaries.sort((a, b) => b.startedAt.localeCompare(a.startedAt));
-
-      const rows: {
-        summary: ConversationSummary;
-        report: ReturnType<typeof computeCacheReport>;
-        health: CacheHealth | null;
-        dumbZone: DumbZoneReport;
-      }[] = [];
-      for (const summary of summaries.slice(0, limit)) {
-        // Only Claude has token-level usage today; skip a conversation with no
-        // token signal rather than reporting a hollow zero (graceful degradation).
-        if (!summary.capabilities.has("tokenUsage")) continue;
-        // Single-provider for now; once summaries carry their source adapter,
-        // load from that one instead of assuming the first available.
-        const owner = adapters.find((a) => a.id === "claude") ?? adapters[0];
-        if (!owner) continue;
-        const convo = await owner.loadConversation(summary.sessionId);
-        if (!convo) continue;
-        const report = computeCacheReport(convo.messages, claudePricing);
-        const dumbZone = computeDumbZoneReport(convo.messages);
-        rows.push({ summary, report, health: cacheHealthFromReport(report), dumbZone });
-      }
-
-      if (g.json) {
-        console.log(
-          JSON.stringify(
-            rows.map((r) => ({
-              sessionId: r.summary.sessionId,
-              title: r.summary.title,
-              totalCost: r.report.totalCost,
-              recoverableBloatCost: r.report.recoverableBloatCost,
-              aboveBaselineContextCost: r.report.aboveBaselineContextCost,
-              finalRampRatio: r.report.finalRampRatio,
-              cacheHitRatio: r.report.cacheHitRatio,
-              health: r.health,
-              dumbZone: r.dumbZone,
-              recommendations: r.report.recommendations,
-            })),
-            null,
-            2,
-          ),
-        );
-        return;
-      }
-
-      if (rows.length === 0) {
-        console.log("No conversations with token data to analyse.");
-        return;
-      }
-
-      const climbingOrWorse = rows.filter(
-        (r) => r.health === "climbing" || r.health === "poor",
-      ).length;
-      const heavyBloat = rows.filter((r) => r.health === "poor").length;
-      const totalRecoverable = rows.reduce((sum, r) => sum + r.report.recoverableBloatCost, 0);
-      const scanned = rows.length;
-      const climbingFraction = `${climbingOrWorse}/${scanned} climbing or worse`;
-      const heavyFraction = heavyBloat > 0 ? `  ·  ${heavyBloat} heavy drift` : "";
-      const recoverableStr =
-        totalRecoverable > 0 ? `  ·  ${formatUSD(totalRecoverable)} recoverable` : "";
-
-      // ── Dumb Zone ──────────────────────────────────────────────────────────
-      // Past ~100k tokens of context, model quality tends to drop off. A single
-      // prompt over the line is noise; staying there for 2+ prompts means the
-      // session should have been cleared, compacted, or split. List who did.
-      const tokK = `${Math.round(DUMB_ZONE_TOKENS / 1000)}k`;
-      const inZone = rows
-        .filter((r) => r.dumbZone.inDumbZone)
-        .sort((a, b) => b.dumbZone.promptsInZone - a.dumbZone.promptsInZone);
-
-      console.log(`\nDumb Zone — context past ${tokK} tokens, where the model gets noticeably worse.`);
-      if (inZone.length === 0) {
-        console.log(`No conversations lingered there. (Flagged at ${DUMB_ZONE_MIN_PROMPTS}+ prompts past ${tokK}.)`);
-      } else {
-        console.log(
-          `${inZone.length}/${rows.length} conversation${inZone.length === 1 ? "" : "s"} kept going past ${tokK} tokens for ${DUMB_ZONE_MIN_PROMPTS}+ prompts:`,
-        );
-        for (const { summary, dumbZone } of inZone) {
-          const id = summary.sessionId.slice(0, 8);
-          const prompts = `${dumbZone.promptsInZone} prompt${dumbZone.promptsInZone === 1 ? "" : "s"} in zone`.padEnd(20);
-          const peak = `peak ${Math.round(dumbZone.peakContextTokens / 1000)}k`.padEnd(11);
-          console.log(`${id}  ${prompts}${peak}${summary.title}`);
-        }
-        console.log("Fix: /clear or /compact at the task boundary, or start a fresh conversation, before context runs past the line.");
-      }
-
-      // ── Bloat table (secondary) ──────────────────────────────────────────────
-      // Biggest recoverable bloat first — the opportunities worth reviewing.
-      console.log("\nBloat (secondary) — recoverable cost from carrying stale context past an early-session baseline.");
-      console.log(`Scanned ${scanned} conversations: ${climbingFraction}${heavyFraction}${recoverableStr}`);
-      rows.sort((a, b) => b.report.recoverableBloatCost - a.report.recoverableBloatCost);
-      // By default the table lists only the conversations worth acting on —
-      // Climbing or Heavy. Pass --all to see every scanned conversation. The
-      // summary line above still counts the full scan either way.
-      const listed = opts.all
-        ? rows
-        : rows.filter((r) => r.health === "climbing" || r.health === "poor");
-      let totalBloat = 0;
-      for (const { summary, report, health, dumbZone } of listed) {
-        totalBloat += report.recoverableBloatCost;
-        const id = summary.sessionId.slice(0, 8);
-        const cost = `cost ${formatUSD(report.totalCost)}`.padEnd(14);
-        const bloat = `bloat ${formatUSD(report.recoverableBloatCost)}`.padEnd(15);
-        const ramp = `ramp ${report.finalRampRatio.toFixed(1)}×`.padEnd(11);
-        const hit = `hit ${(report.cacheHitRatio * 100).toFixed(0)}%`.padEnd(9);
-        const dz = `dumb zone ${dumbZone.inDumbZone ? "yes" : "no"}`.padEnd(15);
-        const healthLabel = bloatHealthLabel(health);
-        console.log(
-          `${id}  ${healthLabel.padEnd(12)}${cost}${bloat}${ramp}${hit}${dz}${summary.title}`,
-        );
-        if (g.verbose) {
-          for (const rec of report.recommendations) {
-            console.log(`            [${rec.severity}] ${rec.title}`);
-            console.log(`              ${rec.message}`);
-          }
-        }
-      }
-      if (listed.length === 0) {
-        console.log("Nothing Climbing or Heavy — every scanned conversation looks healthy. (--all to list them.)");
-      }
-      console.log("\nTo dig deeper, export flagged conversations and upload to an LLM:");
-      console.log("  conversations export                  (saves export-<date>.md)");
-      console.log("  conversations export <id>             (one specific conversation)");
-    });
+  addReportCommand(conversations);
 
   conversations
     .command("export")

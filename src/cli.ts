@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { Command } from "commander";
-import { registerConversations } from "./commands/conversations.js";
+import { registerConversations, addReportCommand } from "./commands/conversations.js";
 import { registerAdapters } from "./adapters/index.js";
 
 registerAdapters();
@@ -22,5 +22,6 @@ program
   .option("--verbose", "include per-finding detail");
 
 registerConversations(program);
+addReportCommand(program);
 
 program.parseAsync(process.argv);
