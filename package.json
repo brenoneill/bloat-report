@@ -7,15 +7,19 @@
     "bloat-report": "dist/cli.js"
   },
   "main": "dist/cli.js",
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "dev": "tsx src/cli.ts",
     "build": "tsup src/cli.ts --format esm --clean",
     "typecheck": "tsc --noEmit",
     "start": "node dist/cli.js",
-    "test": "tsx --test src/analyze/cache.test.ts"
+    "test": "tsx --test src/analyze/cache.test.ts",
+    "prepublishOnly": "npm run build"
   },
-  "author": "",
-  "license": "ISC",
+  "author": "Brendan O'Neill <brendanoneill94@gmail.com>",
+  "license": "MIT",
   "dependencies": {
     "commander": "^14.0.3"
   },

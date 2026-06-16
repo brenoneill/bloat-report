@@ -2,6 +2,10 @@
 
 Your coding agent gets dumber the longer a session runs. Bloat Report is a local, read-only CLI that scans your agent's session transcripts, finds where each one crossed the line, and pairs every finding with the small change that fixes it.
 
+```bash
+npx bloat-report conversations report bloat
+```
+
 ## The dumb zone
 
 Past roughly **100k tokens** of context, models get noticeably worse — reasoning slips, instructions get dropped, the agent forgets what you told it ten turns ago. That's the **dumb zone**, and once a session is in it, every new prompt is answered by a worse version of the model.
@@ -31,28 +35,41 @@ These are non-negotiable (see [CLAUDE.md](CLAUDE.md) for the full set):
 
 ## Install
 
-Requires **Node.js** (with `npm`).
+Requires **Node.js 18+**.
 
 ```bash
-git clone <this-repo>
-cd bloat-report
-npm install
+npm install -g bloat-report
 ```
 
-Run it straight from source:
+Or run without installing:
 
 ```bash
-npm run dev -- conversations list
+npx bloat-report conversations list
 ```
 
-Or build a standalone binary:
+## Example output
 
-```bash
-npm run build        # bundles to dist/cli.js
-node dist/cli.js conversations list
 ```
+$ bloat-report conversations report bloat
 
-The examples below use `npm run dev --`; substitute `node dist/cli.js` if you've built it.
+Dumb Zone — context past 100k tokens, where the model gets noticeably worse.
+3/14 conversations kept going past 100k tokens for 2+ prompts:
+a1b2c3d4  5 prompts in zone   peak 187k   Refactor auth middleware to use JWT
+e5f6a7b8  3 prompts in zone   peak 142k   Add dark mode support to dashboard
+c9d0e1f2  2 prompts in zone   peak 108k   Debug intermittent test failures in CI
+Fix: /clear or /compact at the task boundary, or start a fresh conversation, before context runs past the line.
+
+Bloat (secondary) — recoverable cost from carrying stale context past an early-session baseline.
+Scanned 14 conversations: 4/14 climbing or worse  ·  1 heavy drift  ·  $0.43 recoverable
+a1b2c3d4  Heavy       cost $0.31    bloat $0.21   ramp 8.4×  hit 91%  dumb zone yes   Refactor auth middleware to use JWT
+e5f6a7b8  Climbing    cost $0.18    bloat $0.12   ramp 4.1×  hit 87%  dumb zone yes   Add dark mode support to dashboard
+c9d0e1f2  Climbing    cost $0.14    bloat $0.07   ramp 3.8×  hit 84%  dumb zone yes   Debug intermittent test failures in CI
+f3a4b5c6  Climbing    cost $0.09    bloat $0.03   ramp 3.2×  hit 79%  dumb zone no    Update README and contributing guide
+
+To dig deeper, export flagged conversations and upload to an LLM:
+  conversations export                  (saves export-<date>.md)
+  conversations export <id>             (one specific conversation)
+```
 
 ## Where it reads from
 
@@ -72,9 +89,9 @@ Global flags (work on any command):
 List discovered conversations, most recent first, with token totals and estimated cost.
 
 ```bash
-npm run dev -- conversations list
-npm run dev -- conversations list -n 50            # show more
-npm run dev -- conversations list -p claude        # one provider
+bloat-report conversations list
+bloat-report conversations list -n 50            # show more
+bloat-report conversations list -p claude        # one provider
 ```
 
 - `-n, --limit <count>` — max conversations to show (default 30)
@@ -85,8 +102,8 @@ npm run dev -- conversations list -p claude        # one provider
 Show one conversation in detail — model, cwd, time span, token breakdown, and the signals that conversation carries. Accepts an id prefix.
 
 ```bash
-npm run dev -- conversations detail a1b2c3d4
-npm run dev -- conversations detail a1b2c3d4 --verbose   # per-message timeline
+bloat-report conversations detail a1b2c3d4
+bloat-report conversations detail a1b2c3d4 --verbose   # per-message timeline
 ```
 
 ### `conversations report bloat`
@@ -94,10 +111,10 @@ npm run dev -- conversations detail a1b2c3d4 --verbose   # per-message timeline
 The main event. Scans recent conversations and leads with the **Dumb Zone** roundup — who kept working past the ~100k line — then, as secondary detail, a **bloat table** of recoverable cost, biggest opportunity first.
 
 ```bash
-npm run dev -- conversations report bloat
-npm run dev -- conversations report bloat -a          # show every scanned convo, not just flagged
-npm run dev -- conversations report bloat --verbose   # per-finding detail
-npm run dev -- conversations report bloat --json      # structured output
+bloat-report conversations report bloat
+bloat-report conversations report bloat -a          # show every scanned convo, not just flagged
+bloat-report conversations report bloat --verbose   # per-finding detail
+bloat-report conversations report bloat --json      # structured output
 ```
 
 - `-n, --limit <count>` — max conversations to scan (default 30)
@@ -111,11 +128,11 @@ Conversations with no token data are skipped rather than reported as a hollow ze
 Export conversations as markdown ready to paste into an LLM chatbot (Claude.ai, ChatGPT, …) so you can ask *why* the bloat happened and how to avoid it next time. The export bundles Bloat Report's findings at the top, then the conversation with tool calls and result sizes summarised (thinking blocks and raw tool output are stripped to keep it lean).
 
 ```bash
-npm run dev -- conversations export                   # exports what the bloat report flags
-npm run dev -- conversations export a1b2c3d4 e5f6     # specific conversations
-npm run dev -- conversations export --all             # include healthy ones too
-npm run dev -- conversations export --print           # to terminal instead of a file
-npm run dev -- conversations export -o my-export.md   # custom filename
+bloat-report conversations export                   # exports what the bloat report flags
+bloat-report conversations export a1b2c3d4 e5f6     # specific conversations
+bloat-report conversations export --all             # include healthy ones too
+bloat-report conversations export --print           # to terminal instead of a file
+bloat-report conversations export -o my-export.md   # custom filename
 ```
 
 With no ids, it exports exactly the set the bloat report flags (Climbing/Heavy). By default it saves to `bloat-report-export-<date>.md`.
@@ -160,12 +177,23 @@ The design rule: **adapters normalise, detectors stay provider-agnostic.** Each 
 ## Development
 
 ```bash
-npm run dev        # run from source (tsx)
-npm run build      # bundle with tsup
-npm run typecheck  # tsc --noEmit
-npm test           # run the analysis tests
+git clone <this-repo>
+cd bloat-report
+npm install
+
+npm run dev -- conversations list   # run from source (tsx)
+npm run build                       # bundle to dist/cli.js
+npm run typecheck                   # tsc --noEmit
+npm test                            # run analysis tests
+```
+
+To publish a new version:
+
+```bash
+npm version patch   # or minor / major
+npm publish
 ```
 
 ## License
 
-ISC
+MIT
