@@ -147,8 +147,12 @@ function totalTokens(c: ConversationSummary): number {
 }
 
 export function addReportCommand(parent: Command): void {
-  parent
+  const reportGroup = parent
     .command("report")
+    .description("Detect token-waste patterns and pair each with the small fix");
+
+  reportGroup
+    .command("bloat")
     .description("Find context-bloat patterns and the small change that fixes each")
     .option("-p, --provider <name>", "limit to one provider (e.g. claude, codex)")
     .option("-n, --limit <count>", "max conversations to scan", String(DEFAULT_LIMIT))

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { Command } from "commander";
-import { registerConversations, addReportCommand } from "./commands/conversations.js";
+import { registerConversations } from "./commands/conversations.js";
 import { registerAdapters } from "./adapters/index.js";
 
 registerAdapters();
@@ -13,7 +13,7 @@ program
     "Scan local coding-agent transcripts for wasteful token patterns — " +
       "small changes, big savings. Local-only, read-only.",
   )
-  .version("1.0.0");
+  .version("1.1.0");
 
 // Global flags shared by every command. Output stays tight by default;
 // detail lives behind --verbose / --json (see CLAUDE.md: "Not wasteful itself").
@@ -22,6 +22,5 @@ program
   .option("--verbose", "include per-finding detail");
 
 registerConversations(program);
-addReportCommand(program);
 
 program.parseAsync(process.argv);
